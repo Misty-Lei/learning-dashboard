@@ -725,6 +725,7 @@ function renderMonthlyCalendar() {
       <button class="btn btn-outline btn-sm" onclick="changeCalendarMonth(-1)">${ICONS.chevronLeft.replace('width="24" height="24"','width="16" height="16"')} 上月</button>
       <button class="btn btn-outline btn-sm" onclick="changeCalendarMonth(0)">今天</button>
       <button class="btn btn-outline btn-sm" onclick="changeCalendarMonth(1)">下月 ${ICONS.chevronRight.replace('width="24" height="24"','width="16" height="16"')}</button>
+      <button class="btn btn-sm btn-danger" onclick="clearAllTasks()" title="删除所有板块的全部日程任务">清空全部日程</button>
     </div>
     <div class="cal-grid">
       ${weekHeaders.map(w => `<div class="cal-week-header">${w}</div>`).join('')}
@@ -746,6 +747,18 @@ function changeCalendarMonth(delta) {
     calendarDate.setMonth(calendarDate.getMonth() + delta);
   }
   navigate('home');
+}
+
+// 清空所有板块的全部日程任务（不影响学习项目、目标、打卡记录）
+function clearAllTasks() {
+  const total = state.sections.reduce((sum, s) => sum + (s.tasks || []).length, 0);
+  if (total === 0) { showToast('日历里还没有任何日程', 'info'); return; }
+  if (!confirm(`确定清空日历里全部 ${total} 条日程吗？\n\n学习项目、个人目标、打卡记录都不受影响，但删除的日程无法恢复。`)) return;
+  state.sections.forEach(sec => { sec.tasks = []; });
+  saveData();
+  renderNav();
+  navigate('home');
+  showToast(`已清空全部 ${total} 条日程`, 'success');
 }
 
 // ===== 获取某天的任务（含周重复） =====
