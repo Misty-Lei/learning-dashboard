@@ -13,6 +13,7 @@ let state = {
   inspirations: [],
   checkIns: {},
   checkInAmounts: {},
+  rewards: null,          // 激励系统数据（心愿/券/连续/成就，见 rewards.js）
   currentView: 'home',
   currentSectionId: null,
   currentTab: 'items',
@@ -98,6 +99,7 @@ async function getIDBStatus() {
 // ===== 初始化 =====
 async function init() {
   await loadData();
+  initRewards();
   renderNav();
   startClock();
   navigate('home');
@@ -105,6 +107,8 @@ async function init() {
   setInterval(checkTaskReminders, 60000);
   checkTaskReminders();
   updateStorageStatus(true, true);
+  // 根据历史数据静默补算成就（不弹卡片，避免首次打开连续弹窗）
+  rwCheckAchievements(true);
 }
 
 function setupEventListeners() {
@@ -183,6 +187,7 @@ async function loadData() {
     state.inspirations = data.inspirations || [];
     state.checkIns = data.checkIns || {};
     state.checkInAmounts = data.checkInAmounts || {};
+    state.rewards = ensureRewardsShape(data.rewards);
     migrateItemFields();
     // 同步到 localStorage 兜底
     writeLocalStorage();
@@ -200,6 +205,7 @@ async function loadData() {
       state.inspirations = data.inspirations || [];
       state.checkIns = data.checkIns || {};
       state.checkInAmounts = data.checkInAmounts || {};
+      state.rewards = ensureRewardsShape(data.rewards);
       migrateItemFields();
       // 迁移到 IndexedDB
       saveData();
@@ -233,6 +239,7 @@ function writeLocalStorage() {
       inspirations: state.inspirations,
       checkIns: state.checkIns,
       checkInAmounts: state.checkInAmounts,
+      rewards: state.rewards,
     }));
     return true;
   } catch (e) {
@@ -318,6 +325,7 @@ function loadDefaults() {
   state.inspirations = [];
   state.checkIns = {};
   state.checkInAmounts = {};
+  state.rewards = defaultRewards();
   saveData();
 }
 
@@ -328,6 +336,7 @@ function saveData() {
     inspirations: state.inspirations,
     checkIns: state.checkIns,
     checkInAmounts: state.checkInAmounts,
+    rewards: state.rewards,
   };
   // localStorage 兜底
   const lsOk = writeLocalStorage();
@@ -362,7 +371,7 @@ async function exportData() {
     ? JSON.stringify(idb.data, null, 2)
     : (localStorage.getItem(STORAGE_KEY) || JSON.stringify({
         sections: state.sections, goals: state.goals, inspirations: state.inspirations,
-        checkIns: state.checkIns, checkInAmounts: state.checkInAmounts,
+        checkIns: state.checkIns, checkInAmounts: state.checkInAmounts, rewards: state.rewards,
       }, null, 2));
   const blob = new Blob([data], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -461,6 +470,13 @@ function renderNav() {
   html += '<div class="nav-divider"></div>';
   html += '<div class="nav-section-label">个人空间</div>';
 
+  const ticketCount = state.rewards?.tickets || 0;
+  html += `<div class="nav-item ${state.currentView === 'rewards' ? 'active' : ''}" onclick="navigate('rewards')">
+    <span class="nav-icon">${ICONS.trophy}</span>
+    <span class="nav-label">激励中心</span>
+    <span class="nav-badge nav-badge-ticket" id="navTicketBadge" style="${ticketCount > 0 ? '' : 'display:none'}">${ticketCount}</span>
+  </div>`;
+
   html += `<div class="nav-item ${state.currentView === 'goals' ? 'active' : ''}" onclick="navigate('goals')">
     <span class="nav-icon">${ICONS.target}</span>
     <span class="nav-label">个人目标</span>
@@ -495,6 +511,7 @@ function navigate(view, sectionId = null) {
     section: state.sections.find(s => s.id === sectionId)?.name || '板块',
     goals: '个人目标',
     inspiration: '灵感碎碎念',
+    rewards: '激励中心',
     data: '数据管理',
   };
   document.getElementById('topBarTitle').textContent = titles[view] || '首页';
@@ -504,6 +521,11 @@ function navigate(view, sectionId = null) {
   else if (view === 'section') container.innerHTML = renderSection(sectionId);
   else if (view === 'goals') container.innerHTML = renderGoalsPage();
   else if (view === 'inspiration') container.innerHTML = renderInspirationPage();
+  else if (view === 'rewards') {
+    container.innerHTML = renderRewardsPage();
+    rwUpdateTicketDisplays();
+    rwRefreshNavBadge();
+  }
   else if (view === 'data') {
     container.innerHTML = '<div class="card"><div style="padding:48px;text-align:center;color:var(--ink-lighter);">加载中…</div></div>';
     renderDataPage().then(html => {
@@ -615,6 +637,9 @@ function renderHome() {
       </div>
     </div>
   </div>`;
+
+  // 激励 · 今日动量（连续天数 / 今日完成 / 抽奖券）
+  html += rwHomeWidgetHTML();
 
   // 进度概览 - 圆环可视化
   const ringR = 26, ringCirc = 2 * Math.PI * ringR;
@@ -1515,7 +1540,7 @@ function doCheckIn(sectionId, itemId) {
   item.streak = calculateStreak(sectionId, itemId) + 1;
   item.lastCheckIn = today;
 
-  saveData();
+  recordActivity('checkin', { title: item.name });
   closeModal();
   const newProgress = calcProgress(item);
   showToast(`「${item.name}」打卡成功！+${amount} ${item.unit || '次'}，进度 ${newProgress}%`, 'success');
@@ -1568,8 +1593,14 @@ function calculateStreak(sectionId, itemId) {
 function toggleTask(sectionId, taskId) {
   const sec = state.sections.find(s => s.id === sectionId);
   const task = sec.tasks.find(t => t.id === taskId);
+  const wasCompleted = !!task.completed;
   task.completed = !task.completed;
-  saveData();
+  // 完成任务时计入激励系统（取消完成不扣回，避免反复操作）
+  if (task.completed && !wasCompleted) {
+    recordActivity('task', { title: task.title, minutes: getTaskDuration(task) });
+  } else {
+    saveData();
+  }
   if (state.currentView === 'section') navigate('section', sectionId);
   else if (state.currentView === 'home') navigate('home');
   if (task.completed) showToast('任务已完成', 'success');
@@ -1889,14 +1920,17 @@ function openUpdateProgressModal(goalId, sectionId) {
 
 function saveGoalCompleted(goalId, sectionId) {
   const completed = parseInt(document.getElementById('goalCompletedInput').value) || 0;
+  let goalName = '';
   if (sectionId) {
     const sec = state.sections.find(s => s.id === sectionId);
     const goal = sec.goals.find(g => g.id === goalId);
+    if (goal) goalName = goal.name || '';
     goal.completed = completed;
     const globalGoal = state.goals.find(g => g.id === goalId);
     if (globalGoal) globalGoal.completed = completed;
   } else {
     const goal = state.goals.find(g => g.id === goalId);
+    if (goal) goalName = goal.name || '';
     goal.completed = completed;
     if (goal.section) {
       const sec = state.sections.find(s => s.id === goal.section);
@@ -1904,6 +1938,7 @@ function saveGoalCompleted(goalId, sectionId) {
       if (secGoal) secGoal.completed = completed;
     }
   }
+  recordActivity('progress', { title: goalName });
   saveData();
   closeModal();
   if (sectionId) navigate('section', sectionId);
@@ -1913,14 +1948,17 @@ function saveGoalCompleted(goalId, sectionId) {
 
 function saveGoalProgress(goalId, sectionId) {
   const progress = parseInt(document.getElementById('progressSlider').value);
+  let goalName = '';
   if (sectionId) {
     const sec = state.sections.find(s => s.id === sectionId);
     const goal = sec.goals.find(g => g.id === goalId);
+    if (goal) goalName = goal.name || '';
     goal.progress = progress;
     const globalGoal = state.goals.find(g => g.id === goalId);
     if (globalGoal) globalGoal.progress = progress;
   } else {
     const goal = state.goals.find(g => g.id === goalId);
+    if (goal) goalName = goal.name || '';
     goal.progress = progress;
     if (goal.section) {
       const sec = state.sections.find(s => s.id === goal.section);
@@ -1928,6 +1966,7 @@ function saveGoalProgress(goalId, sectionId) {
       if (secGoal) secGoal.progress = progress;
     }
   }
+  recordActivity('progress', { title: goalName });
   saveData();
   closeModal();
   if (sectionId) navigate('section', sectionId);
@@ -2172,7 +2211,7 @@ function addInspiration() {
     keywords: processed.keywords,
     summary: processed.summary,
   });
-  saveData();
+  recordActivity('inspiration', { title: text.slice(0, 20) });
   navigate('inspiration');
   showToast(`灵感已记录 · 自动归类为「${INSPIRATION_CATEGORIES[processed.category].name}」`, 'success');
 }
@@ -3236,7 +3275,7 @@ function showToast(message, type = 'info') {
   const container = document.getElementById('toastContainer');
   const toast = document.createElement('div');
   toast.className = `toast ${type}`;
-  const icons = { success: '✓', warning: '⚠', error: '✕', info: 'ℹ' };
+  const icons = { success: '✓', warning: '⚠', error: '✕', info: 'ℹ', encourage: '✦' };
   toast.innerHTML = `<span class="toast-icon">${icons[type] || 'ℹ'}</span><span class="toast-text">${message}</span>`;
   container.appendChild(toast);
   setTimeout(() => {
@@ -3413,7 +3452,7 @@ async function cloudBackupNow(notify = true) {
     const idb = await loadFromIDB();
     const data = idb?.data || {
       sections: state.sections, goals: state.goals, inspirations: state.inspirations,
-      checkIns: state.checkIns, checkInAmounts: state.checkInAmounts,
+      checkIns: state.checkIns, checkInAmounts: state.checkInAmounts, rewards: state.rewards,
     };
     const json = JSON.stringify(data);
     const b64 = bytesToBase64(new TextEncoder().encode(json));
