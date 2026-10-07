@@ -6,11 +6,17 @@
  * - 成就里程碑：徽章墙 + 成就卡片（可导出图片）
  * ============================================ */
 
-// ===== 常量配置 =====
-const TASKS_PER_TICKET = 5;      // 每完成多少项学习动作得 1 张抽奖券
+// ===== 抽奖券规则（简单两条）=====
+// 连续学习每满 3 天 → 获得 1 张抽奖券
+// 连续学习每满 7 天 → 额外获得 2 张抽奖券（第 7 / 14 / 21 … 天）
+const STREAK_STEP = 3;           // 每连续多少天得 1 张券
+const STREAK_STEP_TICKETS = 1;   // 每次得到几张
+const STREAK_BONUS_DAYS = 7;     // 每连续多少天额外奖励
+const STREAK_BONUS_TICKETS = 2;  // 额外奖励几张
+
 const FREEZES_PER_MONTH = 2;     // 每月冻结卡数量
-const PITY_MID = 12;             // 连续 12 次未出中奖及以上 → 保底中奖
-const PITY_BIG = 30;             // 连续 30 次 → 保底大奖
+const PITY_MID = 12;             // 连续 12 次未出中奖及以上 → 保底中奖（内部生效，不展示）
+const PITY_BIG = 30;             // 连续 30 次 → 保底大奖（内部生效，不展示）
 const MAX_ACTIVITIES = 600;      // 活动日志上限
 
 const WISH_TIERS = {
@@ -123,6 +129,8 @@ function defaultRewards() {
     streak: {
       current: 0, best: 0, lastDate: '', previousCurrent: 0,
       freezes: FREEZES_PER_MONTH, freezeMonth: '', frozenDates: [], everReset: false, autoFreeze: true,
+      rewardMilestones: [],  // 本段连续期内已发过券的天数点（断签后清空）
+      rewardTicketsTotal: 0, // 累计因连续学习得到的券数
     },
   };
 }
@@ -137,6 +145,8 @@ function ensureRewardsShape(r) {
     if (!Array.isArray(out[k])) out[k] = [];
   });
   if (!Array.isArray(out.streak.frozenDates)) out.streak.frozenDates = [];
+  if (!Array.isArray(out.streak.rewardMilestones)) out.streak.rewardMilestones = [];
+  if (typeof out.streak.rewardTicketsTotal !== 'number') out.streak.rewardTicketsTotal = 0;
   if (!out.achievements || typeof out.achievements !== 'object') out.achievements = {};
   if (!out.flags || typeof out.flags !== 'object') out.flags = {};
   if (!out.celebrated || typeof out.celebrated !== 'object') out.celebrated = {};
@@ -198,6 +208,7 @@ function getRewardStats() {
     streak: r.streak.current,
     bestStreak: r.streak.best,
     tickets: r.tickets,
+    streakTicketsTotal: r.streak.rewardTicketsTotal || 0,
     taskProgress: r.taskProgress,
     pity: r.pity,
     totalDraws: r.totalDraws,
@@ -232,17 +243,19 @@ function recordActivity(type, opts = {}) {
   if (type === 'task') r.totalCompleted += 1;
   if (type === 'checkin') r.totalCheckIns += 1;
 
-  // 连续天数
+  // 连续天数（连续学习的日期越长，奖励越多）
   const streakResult = rwUpdateStreak(today);
 
-  // 抽奖券
+  // 抽奖券：只来自「连续学习天数」里程碑
   let gotTicket = false;
-  if (type === 'task' || type === 'checkin') {
-    r.taskProgress = (r.taskProgress || 0) + 1;
-    if (r.taskProgress >= TASKS_PER_TICKET) {
-      r.taskProgress -= TASKS_PER_TICKET;
-      r.tickets = (r.tickets || 0) + 1;
+  let ticketGain = null;
+  if (streakResult.changed) {
+    const gain = rwGrantStreakTickets(streakResult.prevCurrent, r.streak.current);
+    if (gain.total > 0) {
+      r.tickets = (r.tickets || 0) + gain.total;
+      r.streak.rewardTicketsTotal = (r.streak.rewardTicketsTotal || 0) + gain.total;
       gotTicket = true;
+      ticketGain = gain;
     }
   }
 
@@ -251,9 +264,13 @@ function recordActivity(type, opts = {}) {
   rwFlashStreakArea();
 
   // 反馈
-  if (gotTicket) {
+  if (gotTicket && ticketGain) {
     setTimeout(() => {
-      showToast('攒够啦！获得 1 张抽奖券，可以去开盲盒了', 'success');
+      const last = ticketGain.items[ticketGain.items.length - 1];
+      const why = last.bonus
+        ? `连续 ${last.day} 天，额外奖励 ${ticketGain.total} 张`
+        : `连续 ${last.day} 天，获得 ${ticketGain.total} 张`;
+      showToast(`${why}抽奖券，去开盲盒吧`, 'success');
       rwSparkleBurst(14);
     }, 420);
   } else if (type === 'task' || type === 'checkin') {
@@ -275,7 +292,7 @@ function recordActivity(type, opts = {}) {
 
 function rwUpdateStreak(dateKey) {
   const s = state.rewards.streak;
-  const result = { changed: false, reset: false, frozenUsed: 0, milestone: false };
+  const result = { changed: false, reset: false, frozenUsed: 0, milestone: false, prevCurrent: s.current || 0 };
 
   // 每月重置冻结卡
   const ym = dateKey.slice(0, 7);
@@ -303,6 +320,7 @@ function rwUpdateStreak(dateKey) {
       s.previousCurrent = s.current || 0;
       s.everReset = true;
       s.current = 1;
+      s.rewardMilestones = [];   // 断签后重新开始，券的里程碑也重新计
       result.reset = true;
     }
   }
@@ -312,6 +330,59 @@ function rwUpdateStreak(dateKey) {
   result.changed = true;
   result.milestone = [3, 7, 14, 21, 30, 50, 66, 100, 150, 200, 300, 365].includes(s.current);
   return result;
+}
+
+// ===== 抽奖券发放：只看「连续学习天数」=====
+// 规则（就这两条）：
+//   每连续 3 天 → 1 张券
+//   每连续 7 天 → 额外 2 张券（第 7 / 14 / 21 … 天）
+function rwStreakTicketValue(day) {
+  let n = 0;
+  if (day > 0 && day % STREAK_STEP === 0) n += STREAK_STEP_TICKETS;
+  if (day > 0 && day % STREAK_BONUS_DAYS === 0) n += STREAK_BONUS_TICKETS;
+  return n;
+}
+
+function rwGrantStreakTickets(from, to) {
+  const s = state.rewards.streak;
+  if (!Array.isArray(s.rewardMilestones)) s.rewardMilestones = [];
+  const gain = { total: 0, items: [] };
+  if (!(to > from)) return gain;
+  for (let d = Math.max(1, from + 1); d <= to; d++) {
+    if (s.rewardMilestones.includes(d)) continue;
+    const n = rwStreakTicketValue(d);
+    if (n <= 0) continue;
+    s.rewardMilestones.push(d);
+    gain.total += n;
+    gain.items.push({ day: d, n, bonus: d % STREAK_BONUS_DAYS === 0 });
+  }
+  if (gain.total > 0) s.lastGrantedDay = gain.items[gain.items.length - 1].day;
+  return gain;
+}
+
+// 距离下一张券还差几天、那天能得几张
+function rwNextTicketPlan(days) {
+  const d = Math.max(0, Math.floor(days || 0));
+  let next = 0;
+  for (let i = d + 1; i <= d + Math.max(STREAK_STEP, STREAK_BONUS_DAYS) + 1; i++) {
+    if (rwStreakTicketValue(i) > 0) { next = i; break; }
+  }
+  if (!next) next = d + STREAK_STEP;
+  return { nextDay: next, remain: next - d, gain: rwStreakTicketValue(next) };
+}
+
+// 当前这段连续期里已经因为连续学习拿到过多少张券
+function rwEarnedInCurrentStreak() {
+  const s = state.rewards.streak;
+  return (s.rewardMilestones || []).reduce((n, d) => n + rwStreakTicketValue(d), 0);
+}
+
+// 以 7 天为一轮的进度（用于进度条）
+function rwStreakCycle(days) {
+  const d = Math.max(0, Math.floor(days || 0));
+  const pos = d % STREAK_BONUS_DAYS;
+  const filled = d > 0 && pos === 0 ? STREAK_BONUS_DAYS : pos;
+  return { filled, size: STREAK_BONUS_DAYS, pct: Math.round((filled / STREAK_BONUS_DAYS) * 100) };
 }
 
 function rwMaybeEncourage() {
@@ -425,7 +496,8 @@ function openBlindBox() {
   initRewards();
   if (rwLastDraw) return;
   if ((state.rewards.tickets || 0) <= 0) {
-    showToast(`还没有抽奖券，再完成 ${TASKS_PER_TICKET - (state.rewards.taskProgress || 0)} 项就能攒到 1 张`, 'warning');
+    const plan = rwNextTicketPlan(state.rewards.streak.current);
+    showToast(`还没有抽奖券，再连续学习 ${plan.remain} 天就能拿到 ${plan.gain} 张`, 'warning');
     return;
   }
   const stage = document.getElementById('rwBoxStage');
@@ -499,7 +571,7 @@ function rwBoxIdleHTML() {
     <div class="rw-box-body">
       <div class="rw-box-mark">${can ? '开' : '锁'}</div>
     </div>
-    <div class="rw-box-text">${can ? '点击开箱' : '完成任务攒券'}</div>
+    <div class="rw-box-text">${can ? '点击开箱' : '连续学习得券'}</div>
   </div>`;
 }
 
@@ -509,14 +581,18 @@ function rwUpdateTicketDisplays() {
   if (el) el.textContent = r.tickets || 0;
   const p = document.getElementById('rwTicketProgress');
   if (p) {
-    const need = TASKS_PER_TICKET - (r.taskProgress || 0);
-    p.textContent = `再完成 ${need} 项获得下一张券`;
+    const plan = rwNextTicketPlan(r.streak.current);
+    p.textContent = `再连续 ${plan.remain} 天，可得 ${plan.gain} 张券`;
   }
-  const pityEl = document.getElementById('rwPityText');
-  if (pityEl) {
-    const left = Math.max(0, PITY_MID - (r.pity || 0));
-    pityEl.textContent = left > 0 ? `保底：再抽 ${left} 次必出中奖及以上` : '保底已触发，下次必出中奖及以上';
+  const cycleText = document.getElementById('rwCycleText');
+  if (cycleText) {
+    const cyc = rwStreakCycle(r.streak.current);
+    cycleText.textContent = `本轮第 ${cyc.filled} / ${cyc.size} 天`;
   }
+  const cycleBar = document.getElementById('rwCycleBar');
+  if (cycleBar) cycleBar.style.width = `${rwStreakCycle(r.streak.current).pct}%`;
+  const owned = document.getElementById('rwStreakOwned');
+  if (owned) owned.textContent = rwEarnedInCurrentStreak();
   rwRefreshNavBadge();
 }
 
@@ -827,8 +903,8 @@ function rwHomeWidgetHTML() {
   const r = state.rewards || defaultRewards();
   const st = getRewardStats();
   const stage = rwPlantStage(st.streak);
-  const need = TASKS_PER_TICKET - (r.taskProgress || 0);
-  const pct = Math.round(((r.taskProgress || 0) / TASKS_PER_TICKET) * 100);
+  const plan = rwNextTicketPlan(st.streak);
+  const cyc = rwStreakCycle(st.streak);
 
   return `<div class="card rw-home-card" style="margin-bottom:24px;">
     <div class="section-title">今天，你有在前进 <span class="deco-line"></span></div>
@@ -852,13 +928,16 @@ function rwHomeWidgetHTML() {
       <div class="rw-home-stat">
         <div class="rw-home-num">${r.tickets || 0}</div>
         <div class="rw-home-label">抽奖券</div>
-        <div class="rw-home-sub">再完成 ${need} 项得 1 张</div>
+        <div class="rw-home-sub">再连续 ${plan.remain} 天得 ${plan.gain} 张</div>
       </div>
     </div>
-    <div class="rw-home-bar"><div class="rw-home-bar-fill" style="width:${pct}%"></div></div>
+    <div class="rw-home-cycle">
+      <div class="rw-home-cycle-text">本轮连续 ${cyc.filled} / ${cyc.size} 天</div>
+      <div class="rw-home-bar"><div class="rw-home-bar-fill" style="width:${cyc.pct}%"></div></div>
+    </div>
     <div class="rw-home-actions">
       <button class="btn btn-primary btn-sm" onclick="navigate('rewards')">去开盲盒 / 看成就</button>
-      <span class="rw-home-hint">券来自真实完成，抽奖必有所得（有保底，不会空手）</span>
+      <span class="rw-home-hint">每连续 3 天得 1 张券，每连续 7 天再得 2 张</span>
     </div>
   </div>`;
 }
@@ -956,12 +1035,29 @@ function rwDrawHistoryHTML() {
   </div>`;
 }
 
+// ===== 规则可视化：7 天一格的券点轨道 =====
+function rwCycleTrackHTML(days) {
+  const d = Math.max(0, days || 0);
+  const cyc = rwStreakCycle(d);
+  const cells = [];
+  for (let i = 1; i <= cyc.size; i++) {
+    const reached = cyc.filled >= i;
+    const v = rwStreakTicketValue(i);
+    cells.push(`<div class="rw-cycle-cell ${reached ? 'done' : ''} ${v > 0 ? 'has-ticket' : ''}">
+      <span class="rw-cycle-day">${i}</span>
+      <span class="rw-cycle-ticket">${v > 0 ? `+${v}` : ''}</span>
+    </div>`);
+  }
+  return `<div class="rw-cycle-track">${cells.join('')}</div>`;
+}
+
 function renderRewardsPage() {
   initRewards();
   const r = state.rewards;
   const st = getRewardStats();
   const stage = rwPlantStage(st.streak);
-  const need = TASKS_PER_TICKET - (r.taskProgress || 0);
+  const plan = rwNextTicketPlan(st.streak);
+  const cyc = rwStreakCycle(st.streak);
   const frozenThisMonth = (r.streak.frozenDates || []).filter(d => d.slice(0, 7) === rwToday().slice(0, 7)).length;
 
   return `
@@ -973,14 +1069,20 @@ function renderRewardsPage() {
         <div class="rw-ticket-box">
           <div class="rw-ticket-num" id="rwTicketCount">${r.tickets || 0}</div>
           <div class="rw-ticket-label">张抽奖券</div>
-          <div class="rw-ticket-progress" id="rwTicketProgress">再完成 ${need} 项获得下一张券</div>
-          <div class="rw-ticket-bar"><div class="rw-ticket-bar-fill" style="width:${Math.round((r.taskProgress || 0) / TASKS_PER_TICKET * 100)}%"></div></div>
+          <div class="rw-ticket-progress" id="rwTicketProgress">再连续 ${plan.remain} 天，可得 ${plan.gain} 张券</div>
+          <div class="rw-ticket-bar"><div class="rw-ticket-bar-fill" id="rwCycleBar" style="width:${cyc.pct}%"></div></div>
+          <div class="rw-ticket-cycle" id="rwCycleText">本轮第 ${cyc.filled} / ${cyc.size} 天</div>
         </div>
-        <div class="rw-pity" id="rwPityText">${(r.pity || 0) >= PITY_MID ? '保底已触发，下次必出中奖及以上' : `保底：再抽 ${Math.max(0, PITY_MID - (r.pity || 0))} 次必出中奖及以上`}</div>
       </div>
       <div class="rw-hero-right" id="rwBoxStage">
         ${rwBoxIdleHTML()}
       </div>
+    </div>
+    <div class="rw-rules">
+      <div class="rw-rules-head">抽奖券怎么来</div>
+      <div class="rw-rules-line">连续学习 <b>3 天</b> → 得 <b>1 张</b>券<span class="rw-rules-sep">·</span>连续学习 <b>7 天</b> → 再得 <b>2 张</b>券</div>
+      ${rwCycleTrackHTML(st.streak)}
+      <div class="rw-rules-foot">1 张券 = 开 1 次盲盒，从你的心愿清单里抽中一件兑现。连续断了就重新开始算（冻结卡可以帮你保住记录）。</div>
     </div>
   </div>
 
@@ -994,10 +1096,11 @@ function renderRewardsPage() {
           <div class="rw-streak-num">${st.streak} <span>天</span></div>
           <div class="rw-streak-label">${stage.label}</div>
           <div class="rw-streak-meta">最长连续 ${st.bestStreak} 天 · 本月已用冻结卡 ${frozenThisMonth} 张</div>
+          <div class="rw-streak-earn">这段连续期已获得 <b id="rwStreakOwned">${rwEarnedInCurrentStreak()}</b> 张抽奖券</div>
           <div class="rw-streak-freeze">冻结卡剩余 ${r.streak.freezes} 张（每月 ${FREEZES_PER_MONTH} 张，断签自动保护）</div>
         </div>
       </div>
-      <div class="rw-note">断一天不会清零，冻结卡会帮你保住记录；真的断了也只是重新开始第 1 天，不算失败。</div>
+      <div class="rw-note">小苗苗会随连续学习的日期一天天长大；断一天不会清零，冻结卡会帮你保住记录。</div>
     </div>
 
     <div class="card">

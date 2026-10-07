@@ -1575,6 +1575,46 @@ svg { max-width: 100%; }
   border-left: 3px solid var(--sage);
 }
 
+/* ----- 抽奖券规则（连续天数） ----- */
+.rw-home-cycle { margin-bottom: 14px; }
+.rw-home-cycle-text { font-size: 12px; color: var(--ink-lighter); margin-bottom: 6px; }
+.rw-home-cycle .rw-home-bar { margin-bottom: 0; }
+
+.rw-ticket-cycle { font-size: 12px; color: var(--ink-lighter); margin-top: 8px; }
+
+.rw-rules {
+  margin-top: 24px; padding: 18px 22px;
+  background: linear-gradient(135deg, rgba(95,141,158,0.07), rgba(246,79,123,0.05));
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+}
+.rw-rules-head { font-size: 14px; font-weight: 600; color: var(--ink); margin-bottom: 8px; letter-spacing: 0.5px; }
+.rw-rules-line { font-size: 15px; color: var(--ink-light); line-height: 1.9; }
+.rw-rules-line b { color: var(--primary); font-weight: 600; font-size: 17px; padding: 0 1px; }
+.rw-rules-sep { color: var(--ink-lighter); margin: 0 10px; }
+.rw-rules-foot { font-size: 12px; color: var(--ink-lighter); line-height: 1.8; margin-top: 12px; }
+
+.rw-cycle-track { display: flex; gap: 8px; margin: 14px 0 6px; flex-wrap: wrap; }
+.rw-cycle-cell {
+  width: 54px; height: 54px; border-radius: 13px;
+  background: rgba(255,255,255,0.62);
+  border: 1px solid var(--glass-border);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  color: var(--ink-lighter); transition: all 0.4s var(--ease);
+}
+.rw-cycle-cell.done {
+  background: rgba(246,79,123,0.11);
+  border-color: rgba(246,79,123,0.34);
+  color: var(--ink);
+  box-shadow: 0 3px 12px rgba(246,79,123,0.12);
+}
+.rw-cycle-day { font-size: 12px; line-height: 1; }
+.rw-cycle-ticket { font-size: 11px; font-weight: 600; color: var(--gold-dark); margin-top: 4px; min-height: 13px; line-height: 1; }
+.rw-cycle-cell.done .rw-cycle-ticket { color: var(--primary); }
+
+.rw-streak-earn { font-size: 12px; color: var(--ink-light); margin-top: 8px; }
+.rw-streak-earn b { color: var(--primary); font-weight: 600; font-size: 15px; }
+
 /* ----- 今日小结 ----- */
 .rw-summary {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
