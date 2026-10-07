@@ -19,6 +19,18 @@ const AUTO_MAX_RUNS = 30;          // 每个自动化保留的历史产出次数
 const AUTO_TICK_MS = 30000;        // 定时检查间隔
 const AUTO_AI_STORAGE = 'lanmei_ai_config_v1';  // AI 凭据（仅本机，不同步）
 
+// 参考文件：可被 AI 与本地选题引擎读取，作为产出的上下文
+const AUTO_REF_MAX_FILES = 5;               // 最多几个文件
+const AUTO_REF_MAX_SIZE = 150 * 1024;       // 单个文件上限 150KB
+const AUTO_REF_MAX_TOTAL = 500 * 1024;      // 全部文件总上限 500KB
+const AUTO_REF_AI_PER_FILE = 2500;          // 每个文件喂给 AI 的字数上限
+const AUTO_REF_AI_TOTAL = 8000;             // 所有文件喂给 AI 的总字数上限
+// 能读出内容的文本类文件（其余类型只能记录文件名）
+const AUTO_REF_TEXT_EXT = [
+  'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'html', 'htm', 'xml',
+  'yml', 'yaml', 'log', 'srt', 'vtt', 'js', 'css', 'py', 'tex', 'text',
+];
+
 const AUTO_REPEATS = {
   daily:    { name: '每天' },
   weekdays: { name: '工作日（周一至周五）' },
@@ -286,6 +298,17 @@ function ensureAutosShape(list) {
       : [],
     brief: a.brief || '',
     autoCreateTask: !!a.autoCreateTask,
+    refFiles: Array.isArray(a.refFiles)
+      ? a.refFiles.filter(f => f && f.name).slice(0, AUTO_REF_MAX_FILES).map(f => ({
+          id: f.id || ('rf_' + Math.random().toString(36).slice(2, 9)),
+          name: String(f.name).slice(0, 120),
+          size: Number(f.size) || 0,
+          ext: String(f.ext || '').slice(0, 12),
+          isText: !!f.isText,
+          text: typeof f.text === 'string' ? f.text : '',
+          addedAt: f.addedAt || '',
+        }))
+      : [],
     lastRunDate: a.lastRunDate || '',
     runs: Array.isArray(a.runs) ? a.runs.slice(-AUTO_MAX_RUNS) : [],
   }));
@@ -313,6 +336,130 @@ function migrateSubtasks() {
     });
   });
   return changed;
+}
+
+// ===== 参考文件（上传 / 读取 / 预览）=====
+// 编辑弹窗里的草稿：打开弹窗时从自动化复制一份，保存时写回，取消则丢弃
+let autoDraftRefs = [];
+
+function autoRefExt(name) {
+  const m = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/);
+  return m ? m[1] : '';
+}
+
+function autoRefIsText(file) {
+  if (AUTO_REF_TEXT_EXT.includes(autoRefExt(file.name))) return true;
+  return String(file.type || '').startsWith('text/');
+}
+
+function autoRefFormatSize(n) {
+  const b = Number(n) || 0;
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+function autoRefTotalSize(list) {
+  return (list || []).reduce((n, f) => n + (Number(f.size) || 0), 0);
+}
+
+function autoRefListHTML() {
+  if (!autoDraftRefs.length) {
+    return `<div class="auto-ref-empty">还没有参考文件。可以传你的往期文案、产品资料、爆款清单或笔记，AI 生成选题时会先读它。</div>`;
+  }
+  return autoDraftRefs.map(f => `<div class="auto-ref-item">
+    <div class="auto-ref-item-main">
+      <div class="auto-ref-name">${escapeHtml(f.name)}</div>
+      <div class="auto-ref-meta">${autoRefFormatSize(f.size)} · ${f.isText ? `已读取 ${f.text.length} 字` : '二进制文件，仅记录文件名'}</div>
+    </div>
+    ${f.isText && f.text ? `<button type="button" class="rw-icon-btn" onclick="autoToggleRefPreview('${f.id}')" title="预览">看</button>` : ''}
+    <button type="button" class="rw-icon-btn" onclick="autoRemoveRef('${f.id}')" title="移除">✕</button>
+    ${f.isText && f.text ? `<div class="auto-ref-preview" id="autoRefPreview_${f.id}" style="display:none;">${escapeHtml(f.text.slice(0, 800))}${f.text.length > 800 ? '\n…（仅预览前 800 字）' : ''}</div>` : ''}
+  </div>`).join('');
+}
+
+function autoRefreshRefList() {
+  const box = document.getElementById('autoRefList');
+  if (box) box.innerHTML = autoRefListHTML();
+  const cnt = document.getElementById('autoRefCount');
+  if (cnt) {
+    cnt.textContent = `${autoDraftRefs.length} / ${AUTO_REF_MAX_FILES} 个 · 共 ${autoRefFormatSize(autoRefTotalSize(autoDraftRefs))}`;
+  }
+}
+
+function autoHandleRefFiles(input) {
+  const files = Array.from((input && input.files) || []);
+  if (input) input.value = '';
+  if (!files.length) return;
+
+  const failed = [];
+  let pending = files.length;
+  const finish = () => {
+    autoRefreshRefList();
+    if (failed.length) {
+      showToast(failed[0] + (failed.length > 1 ? `（另有 ${failed.length - 1} 个未添加）` : ''), 'warning');
+    } else {
+      showToast('参考文件已添加，记得点保存', 'success');
+    }
+  };
+  const step = () => { pending -= 1; if (pending === 0) finish(); };
+
+  files.forEach(file => {
+    if (autoDraftRefs.length >= AUTO_REF_MAX_FILES) return (failed.push(`最多只能放 ${AUTO_REF_MAX_FILES} 个参考文件`), step());
+    if (file.size > AUTO_REF_MAX_SIZE) return (failed.push(`「${file.name}」超过 ${autoRefFormatSize(AUTO_REF_MAX_SIZE)}`), step());
+    if (autoRefTotalSize(autoDraftRefs) + file.size > AUTO_REF_MAX_TOTAL) {
+      return (failed.push(`参考文件总大小会超过 ${autoRefFormatSize(AUTO_REF_MAX_TOTAL)}`), step());
+    }
+
+    const isText = autoRefIsText(file);
+    const meta = {
+      id: 'rf_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      name: file.name.slice(0, 120),
+      size: file.size,
+      ext: autoRefExt(file.name),
+      isText,
+      text: '',
+      addedAt: new Date().toISOString(),
+    };
+    const keep = () => {
+      autoDraftRefs = autoDraftRefs.filter(f => f.name !== file.name);  // 同名覆盖
+      autoDraftRefs.push(meta);
+      step();
+    };
+
+    if (!isText) return keep();   // 二进制文件只记录文件名与大小
+    const rd = new FileReader();
+    rd.onerror = () => { failed.push(`读取「${file.name}」失败`); step(); };
+    rd.onload = () => { meta.text = String(rd.result || ''); keep(); };
+    rd.readAsText(file, 'utf-8');
+  });
+}
+
+function autoRemoveRef(refId) {
+  autoDraftRefs = autoDraftRefs.filter(f => f.id !== refId);
+  autoRefreshRefList();
+}
+
+function autoToggleRefPreview(refId) {
+  const el = document.getElementById('autoRefPreview_' + refId);
+  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+// 把所有参考文件的文本拼成一段上下文，供 AI 使用
+function autoRefContextForAI(auto) {
+  const files = (auto.refFiles || []).filter(f => f.isText && f.text);
+  if (!files.length) return '';
+  let left = AUTO_REF_AI_TOTAL;
+  const blocks = [];
+  files.forEach(f => {
+    if (left <= 0) return;
+    const piece = f.text.replace(/\s+/g, ' ').trim().slice(0, Math.min(AUTO_REF_AI_PER_FILE, left));
+    if (!piece) return;
+    left -= piece.length;
+    blocks.push(`【${f.name}】\n${piece}`);
+  });
+  if (!blocks.length) return '';
+  return '我的参考资料（请贴合这些内容来构思，不要照抄原文）：\n' + blocks.join('\n\n');
 }
 
 // ===== AI 凭据（只存本机，不进同步快照：避免 Key 被写进备份文件） =====
@@ -414,6 +561,22 @@ function autoKeywords(auto) {
       if (x.length >= 2 && x.length <= 6) words.push(x);
     });
   });
+  // 参考文件：取出现频次最高的词块，让本地引擎也能贴合你上传的资料
+  const refText = (auto.refFiles || []).filter(f => f.isText && f.text).map(f => f.text).join('\n').slice(0, 20000);
+  if (refText) {
+    const freq = {};
+    refText.split(/[，,。;；、\s:：!？?!"“”()（）\[\]【】/|]+/).forEach(w => {
+      const x = w.trim();
+      if (x.length < 2 || x.length > 6) return;
+      if (/^[\d%.％\-—_]+$/.test(x)) return;
+      freq[x] = (freq[x] || 0) + 1;
+    });
+    Object.keys(freq)
+      .filter(w => freq[w] >= 2)
+      .sort((a, b) => freq[b] - freq[a])
+      .slice(0, 20)
+      .forEach(w => words.push(w));
+  }
   const uniq = [...new Set(words.filter(Boolean))];
   return uniq.length ? uniq : ['这件事', '这个领域'];
 }
@@ -472,11 +635,13 @@ function autoLocalTopics(auto, need) {
 async function autoAITopics(auto, need) {
   const sec = state.sections.find(s => s.id === auto.sectionId);
   const presetLines = auto.presetTopics.slice(0, 20).map(t => `- ${t.title}${t.angle ? '（角度：' + t.angle + '）' : ''}`).join('\n');
+  const refContext = autoRefContextForAI(auto);
   const prompt = [
     '你是一个中文自媒体选题策划。请根据下面的账号定位产出自媒体选题。',
     '',
     '账号定位：' + (auto.brief || '（未填写，请按通用成长/学习类账号处理）'),
     sec ? '所属领域：' + sec.name : '',
+    refContext,
     presetLines ? '我已想过的选题（请避开，不要重复）：\n' + presetLines : '',
     '',
     `请产出 ${need} 个全新选题，要求：`,
@@ -484,6 +649,7 @@ async function autoAITopics(auto, need) {
     '2. 每个选题给出「切入角度」一句话，说明为什么这个角度能打动人。',
     '3. 给出 3–4 步文案结构，每步一行，具体可执行。',
     '4. 语言口语化，不要书面腔，不要 emoji。',
+    refContext ? '5. 选题要能用上参考资料里的具体内容（术语、案例、数字），但不要直接复制原文句子。' : '',
     '',
     '严格只输出 JSON 数组，不要任何解释文字。格式：',
     '[{"title":"标题","angle":"切入角度","script":["步骤1","步骤2","步骤3"],"format":"形式","duration":"建议时长","tags":["标签1","标签2"]}]',
@@ -635,12 +801,16 @@ async function autoRun(auto, notify = true) {
     items = [];
   }
 
+  // 参考文件：产出说明里带上文件名，提醒类任务也能知道该翻哪份资料
+  const refNames = (auto.refFiles || []).map(f => f.name);
+  const refNote = refNames.length ? `参考资料：${refNames.join('、')}` : '';
+
   const run = {
     id: 'run_' + Date.now(),
     date: today,
     ts: Date.now(),
     items,
-    brief: auto.brief || '',
+    brief: [auto.brief, refNote].filter(Boolean).join(' · '),
     warnings,
   };
   auto.runs.push(run);
@@ -928,6 +1098,7 @@ function renderAutomationPage() {
       ${auto.brief ? `<div class="auto-card-brief">${escapeHtml(auto.brief)}</div>` : ''}
       ${auto.kind === 'topic' ? `<div class="auto-card-line">每次产出 ${auto.count} 个选题 · 预设选题库 ${auto.presetTopics.length} 条 · 生成引擎：${aiReady ? 'AI（' + escapeHtml(cfg.model) + '）+ 本地引擎' : '本地选题引擎（未配置 AI）'}</div>` : ''}
       ${auto.autoCreateTask ? `<div class="auto-card-line">运行时自动把产出转成任务（含拆解）</div>` : ''}
+      ${(auto.refFiles || []).length ? `<div class="auto-card-line">参考文件 ${auto.refFiles.length} 个：${auto.refFiles.map(f => escapeHtml(f.name) + (f.isText ? '' : '（未读取内容）')).join('、')}</div>` : ''}
 
       ${lastRun ? `<div class="auto-lastrun">
         <div class="auto-lastrun-head" onclick="autoToggleHistory('${auto.id}')">
@@ -1068,6 +1239,8 @@ function openAutoModal(autoId) {
   const presetText = (a.presetTopics || []).map(t =>
     [t.title, t.angle, (t.tags || []).join(',')].filter(Boolean).join(' | ')
   ).join('\n');
+  // 参考文件走草稿：保存才写回，取消则丢弃
+  autoDraftRefs = (a.refFiles || []).map(f => Object.assign({}, f));
 
   openModal({
     title: editing ? '编辑自动化' : '新建自动化',
@@ -1126,6 +1299,23 @@ function openAutoModal(autoId) {
         <textarea class="input" id="autoBrief" rows="3" placeholder="如：职场新人向的口播短视频，单条 1–3 分钟，讲具体可操作的步骤">${escapeHtml(a.brief)}</textarea>
       </div>
 
+      <div class="form-group">
+        <label class="label">参考文件（可选，生成时会先读它）</label>
+        <div class="auto-ref-box">
+          <div class="auto-ref-list" id="autoRefList">${autoRefListHTML()}</div>
+          <div class="auto-ref-actions">
+            <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('autoRefInput').click()">${ICONS.plus} 选择文件</button>
+            <span class="auto-ref-count" id="autoRefCount"></span>
+          </div>
+          <div class="auto-ref-hint">
+            文本类文件（txt / md / csv / json / srt 等）会把内容读进来，AI 生成选题时先读它；
+            Word、PDF、图片等二进制文件只能记录文件名，内容读不到——想让它们也参与，先转成 txt 或 md 再传。
+            单个 ≤ 150KB，最多 5 个，文件内容会随工作台数据一起保存和备份。
+          </div>
+          <input type="file" id="autoRefInput" multiple style="display:none;" onchange="autoHandleRefFiles(this)">
+        </div>
+      </div>
+
       <div id="autoTopicFields" style="display:${a.kind === 'topic' ? '' : 'none'};">
         <div class="form-group">
           <label class="label">每次产出几个选题</label>
@@ -1163,6 +1353,7 @@ function openAutoModal(autoId) {
       });
     });
   }
+  autoRefreshRefList();
 }
 
 function autoKindChanged() {
@@ -1215,6 +1406,7 @@ function autoSave(autoId) {
     count: parseInt(document.getElementById('autoCount')?.value) || 3,
     presetTopics: autoParsePresets(document.getElementById('autoPresets')?.value),
     autoCreateTask: document.getElementById('autoCreateTask').checked,
+    refFiles: autoDraftRefs.map(f => Object.assign({}, f)),
   };
 
   initAutomation();
