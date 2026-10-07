@@ -773,7 +773,9 @@ function autoHomeCardHTML() {
   const pending = state.automations.filter(a => a.enabled && a.lastRunDate !== today &&
     autoIsDueToday(a, new Date())).length;
 
-  if (!todayRuns.length && !pending && !state.automations.length) return '';
+  // 没有任何自动化时也要显示引导卡片（否则新功能藏得太深，用户发现不了）；
+  // 已配置自动化但今天既无产出、也无待运行的，则不占首页版面。
+  if (state.automations.length && !todayRuns.length && !pending) return '';
 
   let html = `<div class="card auto-home">
     <div class="auto-home-head">
