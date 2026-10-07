@@ -14,6 +14,8 @@ let state = {
   checkIns: {},
   checkInAmounts: {},
   rewards: null,          // 激励系统数据（心愿/券/连续/成就，见 rewards.js）
+  automations: null,      // 自动化任务（见 automation.js）
+  autoRead: {},           // 自动化产出的已读标记
   currentView: 'home',
   currentSectionId: null,
   currentTab: 'items',
@@ -100,6 +102,7 @@ async function getIDBStatus() {
 async function init() {
   await loadData();
   initRewards();
+  initAutomation();
   renderNav();
   startClock();
   navigate('home');
@@ -109,6 +112,8 @@ async function init() {
   updateStorageStatus(true, true);
   // 根据历史数据静默补算成就（不弹卡片，避免首次打开连续弹窗）
   rwCheckAchievements(true);
+  // 自动化：到点触发 + 打开网页时补发错过的
+  startAutomationTimer();
 }
 
 function setupEventListeners() {
@@ -188,7 +193,10 @@ async function loadData() {
     state.checkIns = data.checkIns || {};
     state.checkInAmounts = data.checkInAmounts || {};
     state.rewards = ensureRewardsShape(data.rewards);
+    state.automations = ensureAutosShape(data.automations);
+    state.autoRead = (data.autoRead && typeof data.autoRead === 'object') ? data.autoRead : {};
     migrateItemFields();
+    migrateSubtasks();
     // 同步到 localStorage 兜底
     writeLocalStorage();
     console.info('[数据已从IndexedDB加载]', new Date(idbRecord.ts).toLocaleString());
@@ -206,7 +214,10 @@ async function loadData() {
       state.checkIns = data.checkIns || {};
       state.checkInAmounts = data.checkInAmounts || {};
       state.rewards = ensureRewardsShape(data.rewards);
+      state.automations = ensureAutosShape(data.automations);
+      state.autoRead = (data.autoRead && typeof data.autoRead === 'object') ? data.autoRead : {};
       migrateItemFields();
+      migrateSubtasks();
       // 迁移到 IndexedDB
       saveData();
       return;
@@ -240,6 +251,8 @@ function writeLocalStorage() {
       checkIns: state.checkIns,
       checkInAmounts: state.checkInAmounts,
       rewards: state.rewards,
+      automations: state.automations,
+      autoRead: state.autoRead,
     }));
     return true;
   } catch (e) {
@@ -326,6 +339,8 @@ function loadDefaults() {
   state.checkIns = {};
   state.checkInAmounts = {};
   state.rewards = defaultRewards();
+  state.automations = defaultAutomations();
+  state.autoRead = {};
   saveData();
 }
 
@@ -337,6 +352,8 @@ function saveData() {
     checkIns: state.checkIns,
     checkInAmounts: state.checkInAmounts,
     rewards: state.rewards,
+    automations: state.automations,
+    autoRead: state.autoRead,
   };
   // localStorage 兜底
   const lsOk = writeLocalStorage();
@@ -372,6 +389,7 @@ async function exportData() {
     : (localStorage.getItem(STORAGE_KEY) || JSON.stringify({
         sections: state.sections, goals: state.goals, inspirations: state.inspirations,
         checkIns: state.checkIns, checkInAmounts: state.checkInAmounts, rewards: state.rewards,
+        automations: state.automations, autoRead: state.autoRead,
       }, null, 2));
   const blob = new Blob([data], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -477,6 +495,13 @@ function renderNav() {
     <span class="nav-badge nav-badge-ticket" id="navTicketBadge" style="${ticketCount > 0 ? '' : 'display:none'}">${ticketCount}</span>
   </div>`;
 
+  const autoTodayCount = (state.automations || []).filter(a => a.enabled && a.lastRunDate === todayStr()).length;
+  html += `<div class="nav-item ${state.currentView === 'automation' ? 'active' : ''}" onclick="navigate('automation')">
+    <span class="nav-icon">${ICONS.sparkle}</span>
+    <span class="nav-label">自动化</span>
+    ${(state.automations && state.automations.length) ? `<span class="nav-badge nav-badge-auto" style="${autoTodayCount > 0 ? '' : 'display:none'}">${autoTodayCount}</span>` : ''}
+  </div>`;
+
   html += `<div class="nav-item ${state.currentView === 'goals' ? 'active' : ''}" onclick="navigate('goals')">
     <span class="nav-icon">${ICONS.target}</span>
     <span class="nav-label">个人目标</span>
@@ -512,6 +537,7 @@ function navigate(view, sectionId = null) {
     goals: '个人目标',
     inspiration: '灵感碎碎念',
     rewards: '激励中心',
+    automation: '自动化',
     data: '数据管理',
   };
   document.getElementById('topBarTitle').textContent = titles[view] || '首页';
@@ -525,6 +551,10 @@ function navigate(view, sectionId = null) {
     container.innerHTML = renderRewardsPage();
     rwUpdateTicketDisplays();
     rwRefreshNavBadge();
+  }
+  else if (view === 'automation') {
+    initAutomation();
+    container.innerHTML = renderAutomationPage();
   }
   else if (view === 'data') {
     container.innerHTML = '<div class="card"><div style="padding:48px;text-align:center;color:var(--ink-lighter);">加载中…</div></div>';
@@ -640,6 +670,9 @@ function renderHome() {
 
   // 激励 · 今日动量（连续天数 / 今日完成 / 抽奖券）
   html += rwHomeWidgetHTML();
+
+  // 自动化 · 今日产出
+  html += autoHomeCardHTML();
 
   // 进度概览 - 圆环可视化
   const ringR = 26, ringCirc = 2 * Math.PI * ringR;
@@ -1131,6 +1164,7 @@ function renderTasksTab(sec) {
     const timeStr = formatTaskTime(t);
     const duration = getTaskDuration(t);
     const durationStr = duration > 0 ? ` · ${duration < 60 ? duration + '分钟' : Math.floor(duration/60) + '小时' + (duration%60 > 0 ? (duration%60) + '分' : '')}` : '';
+    const subP = taskSubProgress(t);
     html += `<div class="task-item ${t.completed ? 'completed' : ''}">
       <div class="task-checkbox ${t.completed ? 'checked' : ''}" onclick="toggleTask('${sec.id}','${t.id}')">
         ${t.completed ? ICONS.check : ''}
@@ -1141,10 +1175,21 @@ function renderTasksTab(sec) {
           ${t.date ? `<span class="task-meta-item">${ICONS.calendar.replace('width="18" height="18"','width="12" height="12"')} ${t.date}</span>` : ''}
           ${t.recurringDays ? `<span class="task-meta-item">${ICONS.repeat.replace('width="18" height="18"','width="12" height="12"')} 每周${formatWeekdays(t.recurringDays)}</span>` : ''}
           ${timeStr ? `<span class="task-meta-item">${ICONS.clock.replace('width="18" height="18"','width="12" height="12"')} ${timeStr}${durationStr}</span>` : ''}
+          ${t.fromAutomation ? `<span class="task-meta-item task-meta-auto">来自自动化</span>` : ''}
           <span class="task-priority ${t.priority}">${priorityLabels[t.priority]}</span>
         </div>
+        ${subP ? `<div class="bd-inline">
+          <div class="bd-inline-head">
+            <span>子项 ${subP.done}/${subP.total}</span>
+            <span>${subP.pct}%</span>
+          </div>
+          <div class="bd-inline-bar"><div class="bd-inline-fill" style="width:${subP.pct}%"></div></div>
+        </div>` : ''}
       </div>
-      <button class="task-delete" onclick="deleteTask('${sec.id}','${t.id}')">${ICONS.trash}</button>
+      <div class="task-ops">
+        <button class="task-op" title="拆解成小步骤" onclick="openBreakdownModal('${sec.id}','${t.id}')">${ICONS.grid}</button>
+        <button class="task-delete" onclick="deleteTask('${sec.id}','${t.id}')">${ICONS.trash}</button>
+      </div>
     </div>`;
   });
   html += `</div>`;
@@ -1200,6 +1245,7 @@ async function renderDataPage() {
   const lsSize = (JSON.stringify({
     sections: state.sections, goals: state.goals, inspirations: state.inspirations,
     checkIns: state.checkIns, checkInAmounts: state.checkInAmounts,
+    rewards: state.rewards, automations: state.automations,
   }).length / 1024).toFixed(1);
   const sectionsCount = state.sections.length;
   const itemsCount = state.sections.reduce((sum, s) => sum + (s.items?.length || 0), 0);
@@ -3086,6 +3132,7 @@ function addTask(sectionId) {
     completed: false,
     section: sectionId,
     recurringDays: recurringDays,
+    subtasks: [],
   });
   saveData();
   closeModal();
@@ -3453,6 +3500,7 @@ async function cloudBackupNow(notify = true) {
     const data = idb?.data || {
       sections: state.sections, goals: state.goals, inspirations: state.inspirations,
       checkIns: state.checkIns, checkInAmounts: state.checkInAmounts, rewards: state.rewards,
+      automations: state.automations, autoRead: state.autoRead,
     };
     const json = JSON.stringify(data);
     const b64 = bytesToBase64(new TextEncoder().encode(json));
